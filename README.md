@@ -10,7 +10,7 @@
 
 ---
 
-## 📌 What Is This Project?
+## What Is This Project?
 
 This is a **real-time Security Operations Center (SOC) platform** that automatically detects, enriches, and alerts on cybersecurity threats — with zero human intervention.
 
@@ -24,7 +24,7 @@ This platform solves that by:
 
 ---
 
-## 🎯 Key Innovation — AI False Positive Prediction
+## Key Innovation — AI False Positive Prediction
 
 > **The biggest problem in SOC work is that 90%+ of alerts are false positives.**
 
@@ -61,7 +61,7 @@ If < 40%  → CRITICAL alert, page analyst immediately
 
 ---
 
-## 🏗️ System Architecture
+## System Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -107,7 +107,7 @@ If < 40%  → CRITICAL alert, page analyst immediately
 
 ---
 
-## 🔧 Tech Stack
+## Tech Stack
 
 | Component | Technology | Purpose |
 |---|---|---|
@@ -125,7 +125,7 @@ If < 40%  → CRITICAL alert, page analyst immediately
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 soc-platform/
@@ -162,7 +162,7 @@ soc-platform/
 
 ---
 
-## 🚀 How to Run
+## How to Run
 
 ### Prerequisites
 - Kali Linux / Ubuntu
@@ -194,7 +194,7 @@ Open `http://localhost:5678` in your browser
 
 ---
 
-## 📊 What a Slack Alert Looks Like
+## What a Slack Alert Looks Like
 
 ```
 🔴 HIGH ALERT — Brute Force Detected
@@ -227,28 +227,9 @@ Failed password for root from 185.220.101.45 port 22 ssh2
 SOC Alert Platform
 ```
 
----
 
-## ✅ Current Progress
 
-| Day | Task | Status |
-|---|---|---|
-| Day 1 | Docker installed | ✅ Done |
-| Day 2 | ELK Stack running | ✅ Done |
-| Day 3 | First logs in Kibana | ✅ Done |
-| Day 4 | Filebeat auto-shipping auth.log | ✅ Done |
-| Day 5 | Python brute force detection | ✅ Done |
-| Day 6 | Slack alerting with rich cards | ✅ Done |
-| Day 7 | VirusTotal IP enrichment | ✅ Done |
-| Day 8 | GeoIP location + ML model trained | ✅ Done |
-| Day 9 | ML score in Slack alerts | 🔄 In Progress |
-| Day 10 | n8n workflow integration | ⏳ Pending |
-| Day 11 | Full end-to-end demo | ⏳ Pending |
-| Day 12 | Documentation + report | ⏳ Pending |
-
----
-
-## 🧠 How the ML Model Works (For Non-Technical Readers)
+## How the ML Model Works (For Non-Technical Readers)
 
 Think of the ML model like an experienced SOC analyst who has seen thousands of alerts before. Over time they learn patterns:
 
@@ -272,15 +253,15 @@ The model learns these patterns from 2000 labeled examples and applies them to e
 
 ---
 
-## 👨‍💻 Author
+## Author
 
 **Final Year Student — Bachelor of Computer Science**
 Specialization: Cybersecurity
-Project supervised by: [Professor Name]
+Project supervised by: Ms Sahista Macchhar
 
 ---
 
-## 📜 License
+## License
 
 This project is built for educational purposes as a final year project.
 External services used: VirusTotal API, Slack API, Elastic Stack, MaxMind GeoLite2.
