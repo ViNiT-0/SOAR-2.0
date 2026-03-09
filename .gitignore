@@ -1,0 +1,14 @@
+# env
+.env
+
+# python
+venv/
+__pycache__/
+*.pyc
+
+# ML artifacts
+ml/model.pkl
+ml/training_data.csv
+
+# geoip
+data/*.mmdb
