@@ -1,30 +1,25 @@
 import re
+import ipaddress
 
 def extract_ip_from_logs(log_messages):
     """
     Extracts the first valid external IP from a list of log messages.
     Returns the IP string or None if not found.
     """
-    # Pattern matches standard IPv4
-    ip_pattern = re.compile(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b')
-
-    # These are internal/private IP ranges — skip them
-    def is_internal(ip):
-        return (
-            ip.startswith("127.") or
-            ip.startswith("192.168.") or
-            ip.startswith("10.") or
-            ip.startswith("172.16.") or
-            ip.startswith("172.17.") or
-            ip.startswith("0.") or
-            ip == "255.255.255.255"
-        )
+    # Quick IPv4 candidate matcher; validity is checked by ipaddress.
+    ip_pattern = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
 
     for log in log_messages:
         matches = ip_pattern.findall(log)
         for ip in matches:
-            if not is_internal(ip):
-                return ip
+            try:
+                addr = ipaddress.ip_address(ip)
+            except ValueError:
+                continue
+
+            # Prefer globally routable IPs (skip private/loopback/link-local/etc).
+            if getattr(addr, "is_global", False):
+                return str(addr)
 
     return None
 

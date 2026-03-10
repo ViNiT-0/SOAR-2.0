@@ -4,40 +4,47 @@ import os
 import time
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+import ipaddress
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from enrichment.virustotal import check_ip_reputation, format_vt_summary
 from enrichment.log_parser import extract_ip_from_logs, extract_username_from_logs
 from enrichment.geoip import get_location, format_location
 
-ELASTICSEARCH_URL = "http://localhost:9200"
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+
+ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
 ALERT_INDEX = "soc-alerts"
 LOG_INDEX = "soc-logs-*"
 THRESHOLD = 3
 CHECK_INTERVAL = 60
 
-load_dotenv()
 SLACK_TOKEN = os.getenv("SLACK_TOKEN")
-SLACK_CHANNEL = "#soc-alerts"
+SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "#soc-alerts")
+
+HTTP_TIMEOUT_S = 10
 
 def check_brute_force():
     query = {
         "query": {
             "bool": {
-                "must": [
-                    {"match": {"message": "incorrect password"}},
-                    {"range": {"@timestamp": {"gte": "now-60s"}}}
-                ]
+                "must": [{"range": {"@timestamp": {"gte": "now-60s"}}}],
+                "should": [
+                    {"match_phrase": {"message": "incorrect password"}},
+                    {"match_phrase": {"message": "Failed password"}}
+                ],
+                "minimum_should_match": 1
             }
         },
-        "size": 10,
+        "size": 50,
         "sort": [{"@timestamp": {"order": "desc"}}]
     }
     try:
         response = requests.post(
             f"{ELASTICSEARCH_URL}/{LOG_INDEX}/_search",
             headers={"Content-Type": "application/json"},
-            json=query
+            json=query,
+            timeout=HTTP_TIMEOUT_S
         )
         return response.json()
     except Exception as e:
@@ -56,7 +63,7 @@ def send_slack_alert(hit_count, severity, sample_logs, vt_result, attacker_ip, u
         )
         risk_score = str(vt_result['risk_score'])
     else:
-        vt_text = "Could not retrieve VT data"
+        vt_text = f"Could not retrieve VT data ({vt_result.get('error')})" if vt_result else "Could not retrieve VT data"
         risk_score = "N/A"
 
     location_text = format_location(geo_result) if geo_result else "Unknown"
@@ -125,13 +132,18 @@ def send_slack_alert(hit_count, severity, sample_logs, vt_result, attacker_ip, u
     }
 
     try:
+        if not SLACK_TOKEN:
+            print("[SLACK] SLACK_TOKEN not set — skipping Slack alert")
+            return
+
         response = requests.post(
             "https://slack.com/api/chat.postMessage",
             headers={
                 "Authorization": f"Bearer {SLACK_TOKEN}",
                 "Content-Type": "application/json"
             },
-            json=message
+            json=message,
+            timeout=HTTP_TIMEOUT_S
         )
         result = response.json()
         if result.get("ok"):
@@ -153,9 +165,17 @@ def create_alert(hit_count, sample_logs):
     # VirusTotal check
     vt_result = None
     if attacker_ip:
-        print(f"[ENRICHMENT] Checking VirusTotal for {attacker_ip}...")
-        vt_result = check_ip_reputation(attacker_ip)
-        print(f"[ENRICHMENT] VT Verdict: {vt_result['verdict']}")
+        try:
+            # Guard against accidentally enriching internal/non-global addresses.
+            if not ipaddress.ip_address(attacker_ip).is_global:
+                print("[ENRICHMENT] Non-global IP — skipping VT check")
+            else:
+                print(f"[ENRICHMENT] Checking VirusTotal for {attacker_ip}...")
+                vt_result = check_ip_reputation(attacker_ip)
+        except ValueError:
+            print("[ENRICHMENT] Invalid IP — skipping VT check")
+        if vt_result:
+            print(f"[ENRICHMENT] VT Verdict: {vt_result.get('verdict')}")
     else:
         print("[ENRICHMENT] No external IP found — skipping VT check")
 
@@ -189,7 +209,8 @@ def create_alert(hit_count, sample_logs):
         response = requests.post(
             f"{ELASTICSEARCH_URL}/{ALERT_INDEX}/_doc",
             headers={"Content-Type": "application/json"},
-            json=alert
+            json=alert,
+            timeout=HTTP_TIMEOUT_S
         )
         if response.status_code == 201:
             print(f"[ALERT CREATED] {severity} - {alert['message']}")
