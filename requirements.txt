@@ -4,9 +4,3 @@ geoip2
 pandas
 numpy
 scikit-learn
-requests
-python-dotenv
-geoip2
-pandas
-numpy
-scikit-learn

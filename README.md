@@ -71,8 +71,8 @@ If < 40%  → CRITICAL alert, page analyst immediately
                        │ Raw Logs
                        ▼
 ┌─────────────────────────────────────────────────────────┐
-│                  FILEBEAT (Log Shipper)                  │
-│     Watches /var/log/auth.log → ships to Logstash        │
+│                FILEBEAT (Log Shipper)                    │
+│  Runs on the host and ships auth/system logs to Logstash │
 └──────────────────────┬──────────────────────────────────┘
                        │
                        ▼
@@ -176,12 +176,24 @@ cd ~/soc-platform
 docker compose up -d
 ```
 
-### 2. Activate Python Environment
+### 2. Get Logs Into ELK (Choose One)
+
+**Option A (recommended): Host Filebeat → Logstash (beats input on port 5044)**
+
+- Logstash is configured for Beats input in `elk/logstash/pipeline/logstash.conf` and writes to `soc-logs-YYYY.MM.DD`.
+- Install and configure Filebeat on the host to ship `/var/log/auth.log` (or syslog) to `localhost:5044`.
+- This repo includes `filebeat-8.13.0-amd64.deb` for convenience (Kali/Ubuntu).
+
+**Option B (demo): Send a test document directly to Elasticsearch**
+
+- For quick demos without Filebeat, you can index a few test log lines into `soc-logs-YYYY.MM.DD` and the detector will pick them up.
+
+### 3. Activate Python Environment
 ```bash
 source venv/bin/activate
 ```
 
-### 3. Start the Detection Engine
+### 4. Start the Detection Engine
 ```bash
 python3 detection/brute_force_detector.py
 ```
@@ -226,6 +238,8 @@ Failed password for root from 185.220.101.45 port 22 ssh2
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SOC Alert Platform
 ```
+
+> Note: ML scoring is included in the detector. If `ml/model.pkl` is missing, the detector will skip FP scoring and still alert normally.
 
 
 

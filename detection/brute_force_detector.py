@@ -10,6 +10,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from enrichment.virustotal import check_ip_reputation, format_vt_summary
 from enrichment.log_parser import extract_ip_from_logs, extract_username_from_logs
 from enrichment.geoip import get_location, format_location
+from ml.predict import predict_false_positive, format_fp_bar
 
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 
@@ -23,6 +24,33 @@ SLACK_TOKEN = os.getenv("SLACK_TOKEN")
 SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "#soc-alerts")
 
 HTTP_TIMEOUT_S = 10
+
+def get_historical_alert_count(attacker_ip: str) -> int:
+    if not attacker_ip:
+        return 0
+    query = {
+        "query": {
+            "bool": {
+                "filter": [
+                    {"term": {"attacker_ip.keyword": attacker_ip}},
+                    {"range": {"@timestamp": {"gte": "now-30d"}}}
+                ]
+            }
+        },
+        "size": 0
+    }
+    try:
+        response = requests.post(
+            f"{ELASTICSEARCH_URL}/{ALERT_INDEX}/_search",
+            headers={"Content-Type": "application/json"},
+            json=query,
+            timeout=HTTP_TIMEOUT_S
+        )
+        data = response.json()
+        return int(data.get("hits", {}).get("total", {}).get("value", 0))
+    except Exception as e:
+        print(f"[ERROR] Could not query historical alerts: {e}")
+        return 0
 
 def check_brute_force():
     query = {
@@ -51,7 +79,7 @@ def check_brute_force():
         print(f"[ERROR] Could not query Elasticsearch: {e}")
         return None
 
-def send_slack_alert(hit_count, severity, sample_logs, vt_result, attacker_ip, username, geo_result=None):
+def send_slack_alert(hit_count, severity, sample_logs, vt_result, attacker_ip, username, geo_result=None, fp_result=None):
     color = "#ff0000" if severity == "HIGH" else "#ff9900"
     emoji = "🔴" if severity == "HIGH" else "🟠"
 
@@ -67,6 +95,14 @@ def send_slack_alert(hit_count, severity, sample_logs, vt_result, attacker_ip, u
         risk_score = "N/A"
 
     location_text = format_location(geo_result) if geo_result else "Unknown"
+
+    fp_text = "N/A"
+    fp_reasons = "N/A"
+    fp_action = "N/A"
+    if fp_result:
+        fp_text = f"{format_fp_bar(fp_result['fp_probability'])} — {fp_result['label']}"
+        fp_action = fp_result.get("action", "N/A")
+        fp_reasons = ", ".join(fp_result.get("reasons", [])) or "N/A"
 
     message = {
         "channel": SLACK_CHANNEL,
@@ -119,6 +155,21 @@ def send_slack_alert(hit_count, severity, sample_logs, vt_result, attacker_ip, u
                         "title": "🎯 IP Risk Score",
                         "value": risk_score,
                         "short": True
+                    },
+                    {
+                        "title": "🤖 AI False Positive Score",
+                        "value": fp_text,
+                        "short": False
+                    },
+                    {
+                        "title": "Recommended Action",
+                        "value": fp_action,
+                        "short": True
+                    },
+                    {
+                        "title": "AI Reasons",
+                        "value": fp_reasons,
+                        "short": False
                     },
                     {
                         "title": "Sample Log",
@@ -186,6 +237,31 @@ def create_alert(hit_count, sample_logs):
         geo_result = get_location(attacker_ip)
         print(f"[ENRICHMENT] Location: {format_location(geo_result)}")
 
+    # ML false-positive scoring
+    fp_result = None
+    try:
+        hour_of_day = datetime.now().hour
+        is_internal_ip = 0
+        try:
+            is_internal_ip = 0 if (attacker_ip and ipaddress.ip_address(attacker_ip).is_global) else 1
+        except Exception:
+            is_internal_ip = 0
+
+        fp_result = predict_false_positive(
+            ip_reputation_score=vt_result["risk_score"] if vt_result and not vt_result.get("error") else 0.0,
+            historical_alert_count=get_historical_alert_count(attacker_ip) if attacker_ip else 0,
+            is_internal_ip=is_internal_ip,
+            hour_of_day=hour_of_day,
+            alert_frequency_spike=1 if hit_count >= max(THRESHOLD * 3, 10) else 0,
+            geo_risk_score=geo_result["geo_risk_score"] if geo_result else 0.5,
+            failed_login_ratio=1.0
+        )
+        print(f"[ML] FP Probability: {fp_result['fp_probability']}% ({fp_result['label']})")
+    except FileNotFoundError:
+        print("[ML] model.pkl not found — skipping FP scoring")
+    except Exception as e:
+        print(f"[ML] Could not score false positives: {e}")
+
     # Store alert in Elasticsearch
     alert = {
         "@timestamp": datetime.now(timezone.utc).isoformat(),
@@ -201,6 +277,10 @@ def create_alert(hit_count, sample_logs):
         "geo_city": geo_result["city"] if geo_result else "unknown",
         "geo_country": geo_result["country"] if geo_result else "unknown",
         "geo_risk_score": geo_result["geo_risk_score"] if geo_result else 0.5,
+        "fp_probability": fp_result["fp_probability"] if fp_result else None,
+        "fp_label": fp_result["label"] if fp_result else None,
+        "fp_action": fp_result["action"] if fp_result else None,
+        "fp_reasons": fp_result["reasons"] if fp_result else None,
         "status": "open",
         "sample_logs": sample_logs[:3]
     }
@@ -214,7 +294,7 @@ def create_alert(hit_count, sample_logs):
         )
         if response.status_code == 201:
             print(f"[ALERT CREATED] {severity} - {alert['message']}")
-            send_slack_alert(hit_count, severity, sample_logs, vt_result, attacker_ip, username, geo_result)
+            send_slack_alert(hit_count, severity, sample_logs, vt_result, attacker_ip, username, geo_result, fp_result)
             return True
     except Exception as e:
         print(f"[ERROR] Could not create alert: {e}")
