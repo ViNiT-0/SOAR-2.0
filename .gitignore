@@ -1,15 +1,26 @@
-# env
+# Environment variables (contains secrets)
 .env
-.env.*
 
-# python
+# Python
 venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# ML artifacts
+# ML artifacts (too large for GitHub)
 ml/model.pkl
 ml/training_data.csv
 
-# geoip
+# GeoIP database (too large for GitHub)
 data/*.mmdb
+
+# Filebeat installer
+*.deb
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -15,15 +15,15 @@ from ml.predict import predict_false_positive, format_fp_bar
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 
 ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
-ALERT_INDEX = "soc-alerts"
-LOG_INDEX = "soc-logs-*"
-THRESHOLD = 3
-CHECK_INTERVAL = 60
+ALERT_INDEX       = "soc-alerts"
+LOG_INDEX         = "soc-logs-*"
+THRESHOLD         = 3
+CHECK_INTERVAL    = 60
+HTTP_TIMEOUT_S    = 10
 
-SLACK_TOKEN = os.getenv("SLACK_TOKEN")
+SLACK_TOKEN   = os.getenv("SLACK_TOKEN")
 SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "#soc-alerts")
-
-HTTP_TIMEOUT_S = 10
+N8N_WEBHOOK   = os.getenv("N8N_WEBHOOK", "http://localhost:5678/webhook/soc-alert")
 
 def get_historical_alert_count(attacker_ip: str) -> int:
     if not attacker_ip:
@@ -53,10 +53,7 @@ def get_historical_alert_count(attacker_ip: str) -> int:
         return 0
 
 def find_correlations(attacker_ip: str, username: str):
-    """
-    Look for recent alerts involving the same attacker IP or user.
-    Returns (correlation_count, correlated_types).
-    """
+    """Look for recent alerts involving the same attacker IP or user."""
     if not attacker_ip and (not username or username == "unknown"):
         return 0, []
 
@@ -69,16 +66,13 @@ def find_correlations(attacker_ip: str, username: str):
     query = {
         "query": {
             "bool": {
-                "must": [
-                    {"range": {"@timestamp": {"gte": "now-15m"}}}
-                ],
+                "must": [{"range": {"@timestamp": {"gte": "now-15m"}}}],
                 "should": should_clauses,
                 "minimum_should_match": 1
             }
         },
         "size": 50
     }
-
     try:
         response = requests.post(
             f"{ELASTICSEARCH_URL}/{ALERT_INDEX}/_search",
@@ -122,15 +116,11 @@ def check_brute_force():
         return None
 
 def check_sudo_bruteforce():
-    """
-    Detect repeated sudo authentication failures.
-    """
+    """Detect repeated sudo authentication failures."""
     query = {
         "query": {
             "bool": {
-                "must": [
-                    {"range": {"@timestamp": {"gte": "now-60s"}}}
-                ],
+                "must": [{"range": {"@timestamp": {"gte": "now-60s"}}}],
                 "should": [
                     {"match_phrase": {"message": "incorrect password attempt"}},
                     {"match_phrase": {"message": "authentication failure"}}
@@ -153,7 +143,39 @@ def check_sudo_bruteforce():
         print(f"[ERROR] Could not query Elasticsearch for sudo brute force: {e}")
         return None
 
-def send_slack_alert(hit_count, severity, sample_logs, vt_result, attacker_ip, username, geo_result=None, fp_result=None, attack_type="SSH Brute Force"):
+def send_n8n_webhook(hit_count, severity, attacker_ip, username,
+                     vt_result, geo_result, fp_result, alert_type):
+    """Send alert data to n8n workflow via webhook."""
+    payload = {
+        "severity":       severity,
+        "alert_type":     alert_type,
+        "hit_count":      hit_count,
+        "attacker_ip":    attacker_ip if attacker_ip else "Unknown",
+        "target_user":    username,
+        "vt_verdict":     vt_result.get("verdict", "unknown") if vt_result else "unknown",
+        "geo_country":    geo_result["country"] if geo_result else "unknown",
+        "fp_probability": fp_result["fp_probability"] if fp_result else 0,
+        "fp_label":       fp_result["label"] if fp_result else "unknown",
+        "timestamp":      datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    try:
+        response = requests.post(
+            N8N_WEBHOOK,
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=5
+        )
+        if response.status_code == 200:
+            print(f"[N8N] Webhook sent to n8n ✅")
+        else:
+            print(f"[N8N] Webhook failed: {response.status_code}")
+    except Exception as e:
+        print(f"[N8N ERROR] {e}")
+
+def send_slack_alert(hit_count, severity, sample_logs, vt_result,
+                     attacker_ip, username, geo_result=None,
+                     fp_result=None, attack_type="SSH Brute Force"):
+
     color = "#ff0000" if severity == "HIGH" else "#ff9900"
     emoji = "🔴" if severity == "HIGH" else "🟠"
 
@@ -165,17 +187,17 @@ def send_slack_alert(hit_count, severity, sample_logs, vt_result, attacker_ip, u
         )
         risk_score = str(vt_result['risk_score'])
     else:
-        vt_text = f"Could not retrieve VT data ({vt_result.get('error')})" if vt_result else "Could not retrieve VT data"
+        vt_text    = f"Could not retrieve VT data ({vt_result.get('error')})" if vt_result else "Could not retrieve VT data"
         risk_score = "N/A"
 
     location_text = format_location(geo_result) if geo_result else "Unknown"
 
-    fp_text = "N/A"
+    fp_text    = "N/A"
     fp_reasons = "N/A"
-    fp_action = "N/A"
+    fp_action  = "N/A"
     if fp_result:
-        fp_text = f"{format_fp_bar(fp_result['fp_probability'])} — {fp_result['label']}"
-        fp_action = fp_result.get("action", "N/A")
+        fp_text    = f"{format_fp_bar(fp_result['fp_probability'])} — {fp_result['label']}"
+        fp_action  = fp_result.get("action", "N/A")
         fp_reasons = ", ".join(fp_result.get("reasons", [])) or "N/A"
 
     message = {
@@ -185,73 +207,21 @@ def send_slack_alert(hit_count, severity, sample_logs, vt_result, attacker_ip, u
             {
                 "color": color,
                 "fields": [
-                    {
-                        "title": "Attack Type",
-                        "value": attack_type,
-                        "short": True
-                    },
-                    {
-                        "title": "Failed Attempts",
-                        "value": str(hit_count),
-                        "short": True
-                    },
-                    {
-                        "title": "Attacker IP",
-                        "value": attacker_ip if attacker_ip else "Unknown",
-                        "short": True
-                    },
-                    {
-                        "title": "Target User",
-                        "value": username,
-                        "short": True
-                    },
-                    {
-                        "title": "🌍 Location",
-                        "value": location_text,
-                        "short": True
-                    },
-                    {
-                        "title": "Severity",
-                        "value": severity,
-                        "short": True
-                    },
-                    {
-                        "title": "Time",
-                        "value": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "short": True
-                    },
-                    {
-                        "title": "🦠 VirusTotal Verdict",
-                        "value": vt_text,
-                        "short": False
-                    },
-                    {
-                        "title": "🎯 IP Risk Score",
-                        "value": risk_score,
-                        "short": True
-                    },
-                    {
-                        "title": "🤖 AI False Positive Score",
-                        "value": fp_text,
-                        "short": False
-                    },
-                    {
-                        "title": "Recommended Action",
-                        "value": fp_action,
-                        "short": True
-                    },
-                    {
-                        "title": "AI Reasons",
-                        "value": fp_reasons,
-                        "short": False
-                    },
-                    {
-                        "title": "Sample Log",
-                        "value": sample_logs[0] if sample_logs else "N/A",
-                        "short": False
-                    }
+                    {"title": "Attack Type",           "value": attack_type,                                    "short": True},
+                    {"title": "Failed Attempts",       "value": str(hit_count),                                "short": True},
+                    {"title": "Attacker IP",           "value": attacker_ip if attacker_ip else "Unknown",     "short": True},
+                    {"title": "Target User",           "value": username,                                      "short": True},
+                    {"title": "🌍 Location",           "value": location_text,                                 "short": True},
+                    {"title": "Severity",              "value": severity,                                      "short": True},
+                    {"title": "Time",                  "value": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  "short": True},
+                    {"title": "🦠 VirusTotal Verdict", "value": vt_text,                                       "short": False},
+                    {"title": "🎯 IP Risk Score",      "value": risk_score,                                    "short": True},
+                    {"title": "🤖 AI False Positive Score", "value": fp_text,                                  "short": False},
+                    {"title": "Recommended Action",    "value": fp_action,                                     "short": True},
+                    {"title": "AI Reasons",            "value": fp_reasons,                                    "short": False},
+                    {"title": "Sample Log",            "value": sample_logs[0] if sample_logs else "N/A",      "short": False}
                 ],
-                "footer": "SOC Alert Platform"
+                "footer": "SOC Alert Platform — ML powered"
             }
         ]
     }
@@ -260,7 +230,6 @@ def send_slack_alert(hit_count, severity, sample_logs, vt_result, attacker_ip, u
         if not SLACK_TOKEN:
             print("[SLACK] SLACK_TOKEN not set — skipping Slack alert")
             return
-
         response = requests.post(
             "https://slack.com/api/chat.postMessage",
             headers={
@@ -282,53 +251,51 @@ def create_alert(hit_count, sample_logs, alert_type="ssh_bruteforce"):
     severity = "HIGH" if hit_count > 10 else "MEDIUM"
 
     attacker_ip = extract_ip_from_logs(sample_logs)
-    username = extract_username_from_logs(sample_logs)
+    username    = extract_username_from_logs(sample_logs)
 
     print(f"[ENRICHMENT] Attacker IP: {attacker_ip}")
     print(f"[ENRICHMENT] Target user: {username}")
 
-    # VirusTotal check
+    # VirusTotal
     vt_result = None
     if attacker_ip:
         try:
-            # Guard against accidentally enriching internal/non-global addresses.
             if not ipaddress.ip_address(attacker_ip).is_global:
                 print("[ENRICHMENT] Non-global IP — skipping VT check")
             else:
                 print(f"[ENRICHMENT] Checking VirusTotal for {attacker_ip}...")
                 vt_result = check_ip_reputation(attacker_ip)
+                if vt_result:
+                    print(f"[ENRICHMENT] VT Verdict: {vt_result.get('verdict')}")
         except ValueError:
             print("[ENRICHMENT] Invalid IP — skipping VT check")
-        if vt_result:
-            print(f"[ENRICHMENT] VT Verdict: {vt_result.get('verdict')}")
     else:
         print("[ENRICHMENT] No external IP found — skipping VT check")
 
-    # GeoIP lookup
+    # GeoIP
     geo_result = None
     if attacker_ip:
         print(f"[ENRICHMENT] GeoIP lookup for {attacker_ip}...")
         geo_result = get_location(attacker_ip)
         print(f"[ENRICHMENT] Location: {format_location(geo_result)}")
 
-    # ML false-positive scoring
+    # ML False Positive Scoring
     fp_result = None
     try:
         hour_of_day = datetime.now().hour
-        is_internal_ip = 0
         try:
             is_internal_ip = 0 if (attacker_ip and ipaddress.ip_address(attacker_ip).is_global) else 1
         except Exception:
             is_internal_ip = 0
 
         fp_result = predict_false_positive(
-            ip_reputation_score=vt_result["risk_score"] if vt_result and not vt_result.get("error") else 0.0,
-            historical_alert_count=get_historical_alert_count(attacker_ip) if attacker_ip else 0,
-            is_internal_ip=is_internal_ip,
-            hour_of_day=hour_of_day,
-            alert_frequency_spike=1 if hit_count >= max(THRESHOLD * 3, 10) else 0,
-            geo_risk_score=geo_result["geo_risk_score"] if geo_result else 0.5,
-            failed_login_ratio=1.0
+            ip_reputation_score    = vt_result["risk_score"] if vt_result and not vt_result.get("error") else 0.0,
+            historical_alert_count = get_historical_alert_count(attacker_ip) if attacker_ip else 0,
+            is_internal_ip         = is_internal_ip,
+            hour_of_day            = hour_of_day,
+            alert_frequency_spike  = 1 if hit_count >= max(THRESHOLD * 3, 10) else 0,
+            geo_risk_score         = geo_result["geo_risk_score"] if geo_result else 0.5,
+            failed_login_ratio     = 1.0
         )
         print(f"[ML] FP Probability: {fp_result['fp_probability']}% ({fp_result['label']})")
     except FileNotFoundError:
@@ -336,39 +303,39 @@ def create_alert(hit_count, sample_logs, alert_type="ssh_bruteforce"):
     except Exception as e:
         print(f"[ML] Could not score false positives: {e}")
 
-    # Correlation with existing alerts (same IP or user)
+    # Correlation
     correlation_count, correlated_types = find_correlations(attacker_ip, username)
     correlated = correlation_count > 0
     if correlated and severity == "MEDIUM":
-        print(f"[CORRELATION] Found {correlation_count} related alerts ({', '.join(correlated_types)}) — escalating to HIGH")
+        print(f"[CORRELATION] {correlation_count} related alerts ({', '.join(correlated_types)}) — escalating to HIGH")
         severity = "HIGH"
     elif correlated:
-        print(f"[CORRELATION] Found {correlation_count} related alerts ({', '.join(correlated_types)})")
+        print(f"[CORRELATION] {correlation_count} related alerts ({', '.join(correlated_types)})")
 
-    # Store alert in Elasticsearch
+    # Store in Elasticsearch
     alert = {
-        "@timestamp": datetime.now(timezone.utc).isoformat(),
-        "alert_type": alert_type,
-        "severity": severity,
-        "message": f"Brute force detected: {hit_count} failed login attempts in last 60 seconds",
-        "hit_count": hit_count,
-        "attacker_ip": attacker_ip,
-        "target_user": username,
-        "vt_verdict": vt_result["verdict"] if vt_result else "unknown",
-        "vt_risk_score": vt_result["risk_score"] if vt_result else 0.0,
-        "vt_country": vt_result["country"] if vt_result else "unknown",
-        "geo_city": geo_result["city"] if geo_result else "unknown",
-        "geo_country": geo_result["country"] if geo_result else "unknown",
-        "geo_risk_score": geo_result["geo_risk_score"] if geo_result else 0.5,
-        "fp_probability": fp_result["fp_probability"] if fp_result else None,
-        "fp_label": fp_result["label"] if fp_result else None,
-        "fp_action": fp_result["action"] if fp_result else None,
-        "fp_reasons": fp_result["reasons"] if fp_result else None,
-        "correlated": correlated,
-        "correlation_count": correlation_count,
+        "@timestamp":            datetime.now(timezone.utc).isoformat(),
+        "alert_type":            alert_type,
+        "severity":              severity,
+        "message":               f"Brute force detected: {hit_count} failed login attempts in last 60 seconds",
+        "hit_count":             hit_count,
+        "attacker_ip":           attacker_ip,
+        "target_user":           username,
+        "vt_verdict":            vt_result.get("verdict", "unknown") if vt_result else "unknown",
+        "vt_risk_score":         vt_result.get("risk_score", 0.0) if vt_result else 0.0,
+        "vt_country":            vt_result.get("country", "unknown") if vt_result else "unknown",
+        "geo_city":              geo_result["city"] if geo_result else "unknown",
+        "geo_country":           geo_result["country"] if geo_result else "unknown",
+        "geo_risk_score":        geo_result["geo_risk_score"] if geo_result else 0.5,
+        "fp_probability":        fp_result["fp_probability"] if fp_result else None,
+        "fp_label":              fp_result["label"] if fp_result else None,
+        "fp_action":             fp_result["action"] if fp_result else None,
+        "fp_reasons":            fp_result["reasons"] if fp_result else None,
+        "correlated":            correlated,
+        "correlation_count":     correlation_count,
         "correlated_alert_types": correlated_types,
-        "status": "open",
-        "sample_logs": sample_logs[:3]
+        "status":                "open",
+        "sample_logs":           sample_logs[:3]
     }
 
     try:
@@ -380,9 +347,12 @@ def create_alert(hit_count, sample_logs, alert_type="ssh_bruteforce"):
         )
         if response.status_code == 201:
             print(f"[ALERT CREATED] {severity} - {alert['message']}")
-            # Map alert_type to a human readable attack type for Slack
-            attack_type = "SSH Brute Force" if alert_type == "ssh_bruteforce" else "Sudo Brute Force"
-            send_slack_alert(hit_count, severity, sample_logs, vt_result, attacker_ip, username, geo_result, fp_result, attack_type=attack_type)
+            attack_label = "SSH Brute Force" if alert_type == "ssh_bruteforce" else "Sudo Brute Force"
+            send_n8n_webhook(hit_count, severity, attacker_ip, username,
+                             vt_result, geo_result, fp_result, alert_type)
+            send_slack_alert(hit_count, severity, sample_logs, vt_result,
+                             attacker_ip, username, geo_result, fp_result,
+                             attack_type=attack_label)
             return True
     except Exception as e:
         print(f"[ERROR] Could not create alert: {e}")
@@ -392,56 +362,50 @@ def run_detector():
     print("[SOC DETECTOR] Starting detection engine...")
     print(f"[SOC DETECTOR] Checking every {CHECK_INTERVAL} seconds")
     print(f"[SOC DETECTOR] Threshold: {THRESHOLD} failed logins in 60s")
-    print(f"[SOC DETECTOR] Slack alerts → {SLACK_CHANNEL}")
-    print(f"[SOC DETECTOR] VirusTotal enrichment → enabled")
-    print(f"[SOC DETECTOR] GeoIP enrichment → enabled")
-    print("-" * 50)
+    print(f"[SOC DETECTOR] Slack alerts      → {SLACK_CHANNEL}")
+    print(f"[SOC DETECTOR] VirusTotal        → enabled")
+    print(f"[SOC DETECTOR] GeoIP             → enabled")
+    print(f"[SOC DETECTOR] ML FP Scorer      → enabled")
+    print(f"[SOC DETECTOR] n8n Webhook       → enabled")
+    print(f"[SOC DETECTOR] Correlation       → enabled")
+    print(f"[SOC DETECTOR] Rules             → SSH brute + Sudo brute")
+    print("-" * 55)
 
     while True:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{now}] Running detection checks...")
 
-        # Rule 1: SSH / auth brute force
+        # Rule 1 — SSH / auth brute force
         result = check_brute_force()
-
         if result is None:
-            print(f"[{now}] [SSH BRUTE] Skipping — could not reach Elasticsearch")
+            print(f"[{now}] [SSH] Skipping — could not reach Elasticsearch")
         elif "hits" not in result:
-            print(f"[{now}] [SSH BRUTE] Unexpected response: {result.get('error', {}).get('reason', 'unknown')}")
+            print(f"[{now}] [SSH] Unexpected response")
         else:
             hit_count = result["hits"]["total"]["value"]
-            print(f"[{now}] [SSH BRUTE] Failed logins in last 60s: {hit_count}")
-
+            print(f"[{now}] [SSH] Failed logins in last 60s: {hit_count}")
             if hit_count > THRESHOLD:
-                sample_logs = [
-                    hit["_source"].get("message", "")
-                    for hit in result["hits"]["hits"]
-                ]
+                sample_logs = [hit["_source"].get("message", "") for hit in result["hits"]["hits"]]
                 create_alert(hit_count, sample_logs, alert_type="ssh_bruteforce")
             else:
-                print(f"[{now}] [SSH BRUTE] No threat detected. ({hit_count}/{THRESHOLD} threshold)")
+                print(f"[{now}] [SSH] No threat. ({hit_count}/{THRESHOLD})")
 
-        # Rule 2: sudo brute force
+        # Rule 2 — Sudo brute force
         sudo_result = check_sudo_bruteforce()
-
         if sudo_result is None:
-            print(f"[{now}] [SUDO BRUTE] Skipping — could not reach Elasticsearch")
+            print(f"[{now}] [SUDO] Skipping — could not reach Elasticsearch")
         elif "hits" not in sudo_result:
-            print(f"[{now}] [SUDO BRUTE] Unexpected response: {sudo_result.get('error', {}).get('reason', 'unknown')}")
+            print(f"[{now}] [SUDO] Unexpected response")
         else:
             sudo_hits = sudo_result["hits"]["total"]["value"]
-            print(f"[{now}] [SUDO BRUTE] Failed sudo auth in last 60s: {sudo_hits}")
-
+            print(f"[{now}] [SUDO] Failed sudo auth in last 60s: {sudo_hits}")
             if sudo_hits > THRESHOLD:
-                sudo_logs = [
-                    hit["_source"].get("message", "")
-                    for hit in sudo_result["hits"]["hits"]
-                ]
+                sudo_logs = [hit["_source"].get("message", "") for hit in sudo_result["hits"]["hits"]]
                 create_alert(sudo_hits, sudo_logs, alert_type="sudo_bruteforce")
             else:
-                print(f"[{now}] [SUDO BRUTE] No threat detected. ({sudo_hits}/{THRESHOLD} threshold)")
+                print(f"[{now}] [SUDO] No threat. ({sudo_hits}/{THRESHOLD})")
 
-        print("-" * 50)
+        print("-" * 55)
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
