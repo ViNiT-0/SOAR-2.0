@@ -52,6 +52,48 @@ def get_historical_alert_count(attacker_ip: str) -> int:
         print(f"[ERROR] Could not query historical alerts: {e}")
         return 0
 
+def find_correlations(attacker_ip: str, username: str):
+    """
+    Look for recent alerts involving the same attacker IP or user.
+    Returns (correlation_count, correlated_types).
+    """
+    if not attacker_ip and (not username or username == "unknown"):
+        return 0, []
+
+    should_clauses = []
+    if attacker_ip:
+        should_clauses.append({"term": {"attacker_ip.keyword": attacker_ip}})
+    if username and username != "unknown":
+        should_clauses.append({"term": {"target_user.keyword": username}})
+
+    query = {
+        "query": {
+            "bool": {
+                "must": [
+                    {"range": {"@timestamp": {"gte": "now-15m"}}}
+                ],
+                "should": should_clauses,
+                "minimum_should_match": 1
+            }
+        },
+        "size": 50
+    }
+
+    try:
+        response = requests.post(
+            f"{ELASTICSEARCH_URL}/{ALERT_INDEX}/_search",
+            headers={"Content-Type": "application/json"},
+            json=query,
+            timeout=HTTP_TIMEOUT_S
+        )
+        data = response.json()
+        hits = data.get("hits", {}).get("hits", [])
+        types = {h["_source"].get("alert_type", "unknown") for h in hits}
+        return len(hits), sorted(types)
+    except Exception as e:
+        print(f"[ERROR] Could not query correlations: {e}")
+        return 0, []
+
 def check_brute_force():
     query = {
         "query": {
@@ -79,7 +121,39 @@ def check_brute_force():
         print(f"[ERROR] Could not query Elasticsearch: {e}")
         return None
 
-def send_slack_alert(hit_count, severity, sample_logs, vt_result, attacker_ip, username, geo_result=None, fp_result=None):
+def check_sudo_bruteforce():
+    """
+    Detect repeated sudo authentication failures.
+    """
+    query = {
+        "query": {
+            "bool": {
+                "must": [
+                    {"range": {"@timestamp": {"gte": "now-60s"}}}
+                ],
+                "should": [
+                    {"match_phrase": {"message": "incorrect password attempt"}},
+                    {"match_phrase": {"message": "authentication failure"}}
+                ],
+                "minimum_should_match": 1
+            }
+        },
+        "size": 50,
+        "sort": [{"@timestamp": {"order": "desc"}}]
+    }
+    try:
+        response = requests.post(
+            f"{ELASTICSEARCH_URL}/{LOG_INDEX}/_search",
+            headers={"Content-Type": "application/json"},
+            json=query,
+            timeout=HTTP_TIMEOUT_S
+        )
+        return response.json()
+    except Exception as e:
+        print(f"[ERROR] Could not query Elasticsearch for sudo brute force: {e}")
+        return None
+
+def send_slack_alert(hit_count, severity, sample_logs, vt_result, attacker_ip, username, geo_result=None, fp_result=None, attack_type="SSH Brute Force"):
     color = "#ff0000" if severity == "HIGH" else "#ff9900"
     emoji = "🔴" if severity == "HIGH" else "🟠"
 
@@ -113,7 +187,7 @@ def send_slack_alert(hit_count, severity, sample_logs, vt_result, attacker_ip, u
                 "fields": [
                     {
                         "title": "Attack Type",
-                        "value": "SSH Brute Force",
+                        "value": attack_type,
                         "short": True
                     },
                     {
@@ -204,7 +278,7 @@ def send_slack_alert(hit_count, severity, sample_logs, vt_result, attacker_ip, u
     except Exception as e:
         print(f"[SLACK ERROR] {e}")
 
-def create_alert(hit_count, sample_logs):
+def create_alert(hit_count, sample_logs, alert_type="ssh_bruteforce"):
     severity = "HIGH" if hit_count > 10 else "MEDIUM"
 
     attacker_ip = extract_ip_from_logs(sample_logs)
@@ -262,10 +336,19 @@ def create_alert(hit_count, sample_logs):
     except Exception as e:
         print(f"[ML] Could not score false positives: {e}")
 
+    # Correlation with existing alerts (same IP or user)
+    correlation_count, correlated_types = find_correlations(attacker_ip, username)
+    correlated = correlation_count > 0
+    if correlated and severity == "MEDIUM":
+        print(f"[CORRELATION] Found {correlation_count} related alerts ({', '.join(correlated_types)}) — escalating to HIGH")
+        severity = "HIGH"
+    elif correlated:
+        print(f"[CORRELATION] Found {correlation_count} related alerts ({', '.join(correlated_types)})")
+
     # Store alert in Elasticsearch
     alert = {
         "@timestamp": datetime.now(timezone.utc).isoformat(),
-        "alert_type": "brute_force",
+        "alert_type": alert_type,
         "severity": severity,
         "message": f"Brute force detected: {hit_count} failed login attempts in last 60 seconds",
         "hit_count": hit_count,
@@ -281,6 +364,9 @@ def create_alert(hit_count, sample_logs):
         "fp_label": fp_result["label"] if fp_result else None,
         "fp_action": fp_result["action"] if fp_result else None,
         "fp_reasons": fp_result["reasons"] if fp_result else None,
+        "correlated": correlated,
+        "correlation_count": correlation_count,
+        "correlated_alert_types": correlated_types,
         "status": "open",
         "sample_logs": sample_logs[:3]
     }
@@ -294,14 +380,16 @@ def create_alert(hit_count, sample_logs):
         )
         if response.status_code == 201:
             print(f"[ALERT CREATED] {severity} - {alert['message']}")
-            send_slack_alert(hit_count, severity, sample_logs, vt_result, attacker_ip, username, geo_result, fp_result)
+            # Map alert_type to a human readable attack type for Slack
+            attack_type = "SSH Brute Force" if alert_type == "ssh_bruteforce" else "Sudo Brute Force"
+            send_slack_alert(hit_count, severity, sample_logs, vt_result, attacker_ip, username, geo_result, fp_result, attack_type=attack_type)
             return True
     except Exception as e:
         print(f"[ERROR] Could not create alert: {e}")
     return False
 
 def run_detector():
-    print("[SOC DETECTOR] Starting brute force detection...")
+    print("[SOC DETECTOR] Starting detection engine...")
     print(f"[SOC DETECTOR] Checking every {CHECK_INTERVAL} seconds")
     print(f"[SOC DETECTOR] Threshold: {THRESHOLD} failed logins in 60s")
     print(f"[SOC DETECTOR] Slack alerts → {SLACK_CHANNEL}")
@@ -311,26 +399,47 @@ def run_detector():
 
     while True:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{now}] Running detection check...")
+        print(f"[{now}] Running detection checks...")
 
+        # Rule 1: SSH / auth brute force
         result = check_brute_force()
 
         if result is None:
-            print(f"[{now}] Skipping — could not reach Elasticsearch")
+            print(f"[{now}] [SSH BRUTE] Skipping — could not reach Elasticsearch")
         elif "hits" not in result:
-            print(f"[{now}] Unexpected response: {result.get('error', {}).get('reason', 'unknown')}")
+            print(f"[{now}] [SSH BRUTE] Unexpected response: {result.get('error', {}).get('reason', 'unknown')}")
         else:
             hit_count = result["hits"]["total"]["value"]
-            print(f"[{now}] Failed logins in last 60s: {hit_count}")
+            print(f"[{now}] [SSH BRUTE] Failed logins in last 60s: {hit_count}")
 
             if hit_count > THRESHOLD:
                 sample_logs = [
                     hit["_source"].get("message", "")
                     for hit in result["hits"]["hits"]
                 ]
-                create_alert(hit_count, sample_logs)
+                create_alert(hit_count, sample_logs, alert_type="ssh_bruteforce")
             else:
-                print(f"[{now}] No threat detected. ({hit_count}/{THRESHOLD} threshold)")
+                print(f"[{now}] [SSH BRUTE] No threat detected. ({hit_count}/{THRESHOLD} threshold)")
+
+        # Rule 2: sudo brute force
+        sudo_result = check_sudo_bruteforce()
+
+        if sudo_result is None:
+            print(f"[{now}] [SUDO BRUTE] Skipping — could not reach Elasticsearch")
+        elif "hits" not in sudo_result:
+            print(f"[{now}] [SUDO BRUTE] Unexpected response: {sudo_result.get('error', {}).get('reason', 'unknown')}")
+        else:
+            sudo_hits = sudo_result["hits"]["total"]["value"]
+            print(f"[{now}] [SUDO BRUTE] Failed sudo auth in last 60s: {sudo_hits}")
+
+            if sudo_hits > THRESHOLD:
+                sudo_logs = [
+                    hit["_source"].get("message", "")
+                    for hit in sudo_result["hits"]["hits"]
+                ]
+                create_alert(sudo_hits, sudo_logs, alert_type="sudo_bruteforce")
+            else:
+                print(f"[{now}] [SUDO BRUTE] No threat detected. ({sudo_hits}/{THRESHOLD} threshold)")
 
         print("-" * 50)
         time.sleep(CHECK_INTERVAL)
